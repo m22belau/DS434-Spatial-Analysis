@@ -1,0 +1,529 @@
+---
+title: "Optimal Fire Station Placement on Oahu"
+subtitle: "A Spatial Optimization Analysis"
+format: html
+editor: visual
+---
+
+## Introduction
+
+This analysis identifies the optimal location for a **new fire station on Oahu** to maximize emergency response coverage. Using spatial optimization, we combine population data, current coverage gaps, and land use suitability to produce a data-driven recommendation.
+
+**Research Question:** Where are the spatial gaps in fire station coverage on Oahu, and where should a new fire station be located to maximize emergency response accessibility while respecting land use constraints?
+
+------------------------------------------------------------------------
+
+## Setup
+
+```{r}
+#| message: false
+#| warning: false
+
+library(tidyverse)
+library(tidycensus)
+library(sf)
+library(mapview)
+library(spopt)
+library(osmdata)
+library(RColorBrewer)
+```
+
+------------------------------------------------------------------------
+
+## Step 1: Load and Filter Data to Main Island
+
+We load fire stations and census tracts, then immediately project to UTM Zone 4N (EPSG:32604) for accurate distance calculations in meters. Because Honolulu County includes the Northwestern Hawaiian Islands, we filter to the main Oahu island only using easting coordinates.
+
+```{r}
+#| message: false
+#| warning: false
+
+# Load existing fire stations
+fire_stations_raw <- st_read(
+  "/Users/berylinlau/Downloads/Fire_Stations_-_Island_of_Oahu.geojson",
+  quiet = TRUE
+)
+
+# Load population data for Honolulu County
+oahu_tracts_raw <- get_acs(
+  geography = "tract",
+  variables = "B01003_001",
+  state = "HI",
+  county = "Honolulu",
+  geometry = TRUE,
+  year = 2022
+)
+
+# Project both to UTM Zone 4N immediately
+fire_stations_raw <- st_transform(fire_stations_raw, 32604)
+oahu_tracts_raw   <- st_transform(oahu_tracts_raw, 32604)
+
+# Filter to main Oahu island only (easting > 500,000 m removes outer islands)
+oahu_tracts <- oahu_tracts_raw |>
+  mutate(centroid_x = st_coordinates(st_centroid(geometry))[, 1]) |>
+  filter(centroid_x > 500000) |>
+  select(-centroid_x)
+
+oahu_boundary <- st_union(oahu_tracts) |> st_make_valid()
+
+fire_stations <- fire_stations_raw |>
+  filter(lengths(st_intersects(fire_stations_raw, oahu_boundary)) > 0)
+
+cat("Census tracts (main island):", nrow(oahu_tracts), "\n")
+cat("Fire stations (main island):", nrow(fire_stations), "\n")
+cat("Total population:", format(sum(oahu_tracts$estimate), big.mark = ","), "\n")
+
+# Compute bbox in lon/lat for OSM downloads
+oahu_bbox <- st_bbox(st_transform(oahu_tracts, 4326))
+```
+
+```{r}
+# Map existing fire stations
+mapview(oahu_tracts,
+        layer.name = "Census Tracts",
+        alpha.regions = 0.1) +
+  mapview(fire_stations,
+          col.regions = "red",
+          cex = 6,
+          layer.name = "Existing Fire Stations")
+```
+
+Oahu's main island has **`r nrow(fire_stations)` fire stations** serving a population of **`r format(sum(oahu_tracts$estimate), big.mark = ",")`** across **`r nrow(oahu_tracts)` census tracts**.
+
+------------------------------------------------------------------------
+
+## Step 2: Download and Classify Land Use
+
+We download land use polygons from OpenStreetMap and assign each a **suitability score (1--5)** for fire station placement, based on how easily the land could be converted or acquired.
+
+```{r}
+#| message: false
+#| warning: false
+
+sf_use_s2(FALSE)
+
+# Download land use polygons
+landuse_raw <- opq(bbox = oahu_bbox) |>
+  add_osm_feature(key = "landuse") |>
+  osmdata_sf()
+
+landuse_classified <- landuse_raw$osm_polygons |>
+  select(osm_id, landuse) |>
+  st_transform(32604) |>
+  st_make_valid() |>
+  mutate(
+    zone_type = case_when(
+      landuse %in% c("residential", "apartments")                           ~ "Residential",
+      landuse %in% c("commercial", "retail")                                ~ "Commercial",
+      landuse %in% c("industrial", "construction")                          ~ "Industrial",
+      landuse %in% c("military", "government")                              ~ "Government/Public",
+      landuse %in% c("recreation_ground", "park", "grass",
+                     "cemetery", "village_green")                           ~ "Open Space/Parks",
+      landuse %in% c("institutional", "education", "hospital", "religious") ~ "Institutional",
+      landuse %in% c("farmland", "farm", "orchard", "meadow")              ~ "Agricultural",
+      landuse == "forest"                                                    ~ "Forest",
+      TRUE                                                                   ~ "Other"
+    ),
+    suitability = case_when(
+      zone_type == "Government/Public"                      ~ 5,
+      zone_type %in% c("Open Space/Parks", "Commercial")   ~ 4,
+      zone_type %in% c("Institutional", "Industrial")      ~ 3,
+      zone_type %in% c("Residential", "Agricultural")      ~ 2,
+      TRUE                                                  ~ 1
+    ),
+    conversion_category = case_when(
+      suitability >= 4 ~ "No Conversion Needed",
+      suitability == 3 ~ "Minor Rezoning Required",
+      suitability == 2 ~ "Major Conversion Required",
+      TRUE             ~ "Not Feasible"
+    )
+  )
+
+cat("Land use polygons downloaded:", nrow(landuse_classified), "\n")
+```
+
+```{r}
+mapview(landuse_classified,
+        zcol = "suitability",
+        layer.name = "Land Use Suitability (1-5)",
+        col.regions = RColorBrewer::brewer.pal(5, "RdYlGn"),
+        alpha.regions = 0.7) +
+  mapview(fire_stations,
+          col.regions = "blue",
+          cex = 7,
+          layer.name = "Existing Stations")
+```
+
+**Suitability scale:** 5 = Government/Public land (ideal) → 1 = Forest (not feasible)
+
+------------------------------------------------------------------------
+
+## Step 3: Calculate Current Coverage
+
+We calculate the straight-line distance from each census tract centroid to the nearest fire station, with a 1.5× terrain adjustment factor to approximate road travel distance. Tracts are classified into three coverage tiers.
+
+```{r}
+tract_centroids <- st_centroid(oahu_tracts)
+dist_matrix     <- st_distance(tract_centroids, fire_stations)
+dist_matrix_adj <- as.matrix(dist_matrix) * 1.5
+
+oahu_tracts <- oahu_tracts |>
+  mutate(
+    dist_to_nearest_m     = apply(dist_matrix_adj, 1, min),
+    dist_to_nearest_miles = dist_to_nearest_m / 1609.34,
+    coverage_status = case_when(
+      dist_to_nearest_miles <= 2 ~ "Well Covered (< 2 mi)",
+      dist_to_nearest_miles <= 4 ~ "Moderate Coverage (2-4 mi)",
+      TRUE                       ~ "Poor Coverage (> 4 mi)"
+    )
+  )
+
+oahu_tracts$coverage_status <- factor(
+  oahu_tracts$coverage_status,
+  levels = c("Well Covered (< 2 mi)", "Moderate Coverage (2-4 mi)", "Poor Coverage (> 4 mi)")
+)
+
+coverage_summary <- oahu_tracts |>
+  st_drop_geometry() |>
+  group_by(coverage_status) |>
+  summarize(
+    n_tracts        = n(),
+    total_pop       = sum(estimate),
+    pct_population  = round(total_pop / sum(oahu_tracts$estimate) * 100, 1),
+    mean_dist_miles = round(mean(dist_to_nearest_miles), 1),
+    .groups = "drop"
+  ) |>
+  arrange(coverage_status)
+
+knitr::kable(coverage_summary,
+             col.names = c("Coverage Status", "Tracts", "Population",
+                           "% of Population", "Mean Distance (mi)"),
+             caption = "Current fire station coverage on Oahu")
+```
+
+```{r}
+mapview(oahu_tracts,
+        zcol = "coverage_status",
+        layer.name = "Coverage Status",
+        col.regions = c("lightgreen", "yellow", "red"),
+        alpha.regions = 0.65) +
+  mapview(fire_stations,
+          col.regions = "blue",
+          cex = 7,
+          layer.name = "Existing Stations")
+```
+
+**`r coverage_summary$pct_population[coverage_summary$coverage_status == "Poor Coverage (> 4 mi)"]`%** of Oahu's population lives more than 4 miles from the nearest fire station.
+
+------------------------------------------------------------------------
+
+## Step 4: Calculate Response Need Score
+
+We create a composite **Total Need Score** combining two factors:
+
+-   **Distance (60% weight):** Tracts farther from stations score higher
+-   **Population density (40% weight):** Denser tracts score higher
+
+This ensures the optimization prioritizes areas that are both underserved *and* populous.
+
+```{r}
+oahu_tracts <- oahu_tracts |>
+  mutate(
+    area_sq_miles      = as.numeric(st_area(geometry)) / 2589988.11,
+    pop_density        = estimate / area_sq_miles,
+    distance_scaled    = (dist_to_nearest_miles - min(dist_to_nearest_miles, na.rm = TRUE)) /
+                         (max(dist_to_nearest_miles, na.rm = TRUE) - min(dist_to_nearest_miles, na.rm = TRUE)),
+    pop_density_scaled = (pop_density - min(pop_density, na.rm = TRUE)) /
+                         (max(pop_density, na.rm = TRUE) - min(pop_density, na.rm = TRUE)),
+    per_capita_need    = distance_scaled * 60 + pop_density_scaled * 40,
+    total_need         = per_capita_need * estimate
+  )
+
+oahu_tracts |>
+  st_drop_geometry() |>
+  arrange(desc(total_need)) |>
+  select(NAME, estimate, dist_to_nearest_miles, pop_density, per_capita_need, total_need) |>
+  head(10) |>
+  knitr::kable(digits = 1, caption = "Top 10 highest-need census tracts")
+```
+
+```{r}
+mapview(oahu_tracts,
+        zcol = "total_need",
+        layer.name = "Total Response Need Score",
+        col.regions = RColorBrewer::brewer.pal(9, "YlOrRd"),
+        alpha.regions = 0.7) +
+  mapview(fire_stations,
+          col.regions = "blue",
+          cex = 6,
+          layer.name = "Existing Stations")
+```
+
+------------------------------------------------------------------------
+
+## Step 5: Generate Candidate Sites
+
+We create a 20×20 grid of candidate locations across the main island, then filter to points on land that are more than 1 mile from an existing station. Each candidate is assigned a land use suitability score.
+
+```{r}
+set.seed(2025)
+sf_use_s2(FALSE)
+
+bbox  <- st_bbox(oahu_tracts)
+x_seq <- seq(bbox["xmin"], bbox["xmax"], length.out = 20)
+y_seq <- seq(bbox["ymin"], bbox["ymax"], length.out = 20)
+
+grid_points <- expand.grid(x = x_seq, y = y_seq) |>
+  st_as_sf(coords = c("x", "y"), crs = 32604)
+
+on_land        <- lengths(st_intersects(grid_points, oahu_boundary)) > 0
+candidate_grid <- grid_points[on_land, ] |>
+  mutate(candidate_id = row_number())
+
+dist_to_existing  <- st_distance(candidate_grid, fire_stations)
+min_dist_existing <- apply(dist_to_existing, 1, min)
+
+candidate_grid <- candidate_grid |>
+  mutate(min_dist_miles = as.numeric(min_dist_existing) / 1609.34) |>
+  filter(min_dist_miles > 1)
+
+candidate_sites <- candidate_grid |>
+  st_join(st_make_valid(landuse_classified), join = st_intersects, left = TRUE) |>
+  mutate(
+    suitability = if_else(is.na(suitability), 3L, as.integer(suitability)),
+    zone_type   = if_else(is.na(zone_type), "Unknown/Undeveloped", zone_type),
+    conversion_category = case_when(
+      suitability >= 4 ~ "No Conversion Needed",
+      suitability == 3 ~ "Minor Rezoning Required",
+      suitability == 2 ~ "Major Conversion Required",
+      TRUE             ~ "Not Feasible"
+    )
+  ) |>
+  group_by(candidate_id) |>
+  slice_max(suitability, n = 1, with_ties = FALSE) |>
+  ungroup()
+
+candidate_sites_suitable <- candidate_sites |> filter(suitability >= 3)
+
+cat("Total candidates:", nrow(candidate_sites), "\n")
+cat("Suitable candidates (suitability >= 3):", nrow(candidate_sites_suitable), "\n")
+```
+
+```{r}
+mapview(oahu_tracts,
+        zcol = "total_need",
+        layer.name = "Total Need",
+        col.regions = RColorBrewer::brewer.pal(9, "YlOrRd"),
+        alpha.regions = 0.4) +
+  mapview(candidate_sites,
+          zcol = "suitability",
+          layer.name = "Candidate Sites (Suitability)",
+          col.regions = RColorBrewer::brewer.pal(5, "RdYlGn"),
+          cex = 4) +
+  mapview(fire_stations,
+          col.regions = "red",
+          cex = 7,
+          layer.name = "Existing Stations")
+```
+
+------------------------------------------------------------------------
+
+## Step 6: Spatial Optimization
+
+We use the **p-median algorithm** to find candidate locations that minimize population-weighted distance. We run three scenarios: unconstrained (any land), constrained (suitable land only), and a 3-station constrained solution.
+
+```{r}
+if (nrow(candidate_sites_suitable) < 3) {
+  candidate_sites_suitable <- candidate_sites
+}
+
+result_unconstrained <- p_median(
+  demand       = oahu_tracts,
+  facilities   = candidate_sites,
+  n_facilities = 1,
+  weight_col   = "total_need"
+)
+
+result_constrained <- p_median(
+  demand       = oahu_tracts,
+  facilities   = candidate_sites_suitable,
+  n_facilities = 1,
+  weight_col   = "total_need"
+)
+
+result_3stations <- p_median(
+  demand       = oahu_tracts,
+  facilities   = candidate_sites_suitable,
+  n_facilities = 3,
+  weight_col   = "total_need"
+)
+
+selected_unconstrained <- result_unconstrained$facilities |> filter(.selected)
+selected_constrained   <- result_constrained$facilities   |> filter(.selected)
+selected_3stations     <- result_3stations$facilities     |> filter(.selected)
+
+cat("Unconstrained optimum zone:", selected_unconstrained$zone_type, "\n")
+cat("Constrained optimum zone:  ", selected_constrained$zone_type, "\n")
+```
+
+------------------------------------------------------------------------
+
+## Step 7: Results
+
+### Recommended Single Station (Zoning-Constrained)
+
+```{r}
+optimal_site <- selected_constrained |> st_drop_geometry()
+
+cat("Zone Type:        ", optimal_site$zone_type, "\n")
+cat("Suitability:      ", optimal_site$suitability, "/ 5\n")
+cat("Conversion:       ", optimal_site$conversion_category, "\n")
+cat("Dist from nearest:", round(optimal_site$min_dist_miles, 1), "miles\n")
+```
+
+```{r}
+all_stations_1 <- bind_rows(
+  fire_stations        |> mutate(type = "Existing"),
+  selected_constrained |> mutate(type = "Proposed")
+)
+
+dist_new_adj <- as.matrix(st_distance(tract_centroids, all_stations_1)) * 1.5
+
+oahu_tracts_new <- oahu_tracts |>
+  mutate(
+    dist_new_miles    = apply(dist_new_adj, 1, min) / 1609.34,
+    improvement_miles = dist_to_nearest_miles - dist_new_miles
+  )
+
+tibble(
+  Metric = c("Mean distance to nearest station (miles)",
+             "Population within 2 miles",
+             "Population beyond 4 miles"),
+  Before = c(
+    round(mean(oahu_tracts$dist_to_nearest_miles), 2),
+    sum(oahu_tracts$estimate[oahu_tracts$dist_to_nearest_miles <= 2]),
+    sum(oahu_tracts$estimate[oahu_tracts$dist_to_nearest_miles > 4])
+  ),
+  After = c(
+    round(mean(oahu_tracts_new$dist_new_miles), 2),
+    sum(oahu_tracts_new$estimate[oahu_tracts_new$dist_new_miles <= 2]),
+    sum(oahu_tracts_new$estimate[oahu_tracts_new$dist_new_miles > 4])
+  )
+) |>
+  mutate(Improvement = Before - After,
+         `% Change`  = round((Improvement / Before) * 100, 1)) |>
+  knitr::kable(caption = "Coverage improvement: 1 new station",
+               format.args = list(big.mark = ","))
+```
+
+```{r}
+mapview(oahu_tracts_new,
+        zcol = "improvement_miles",
+        layer.name = "Distance Improvement (miles)",
+        col.regions = RColorBrewer::brewer.pal(9, "Blues"),
+        alpha.regions = 0.65) +
+  mapview(fire_stations,
+          col.regions = "red",
+          cex = 7,
+          layer.name = "Existing Stations") +
+  mapview(selected_constrained,
+          col.regions = "darkgreen",
+          cex = 14,
+          layer.name = "Recommended New Station")
+```
+
+### 3-Station Solution
+
+```{r}
+all_stations_3 <- bind_rows(
+  fire_stations      |> mutate(type = "Existing"),
+  selected_3stations |> mutate(type = "Proposed")
+)
+
+dist_new3_adj <- as.matrix(st_distance(tract_centroids, all_stations_3)) * 1.5
+
+oahu_tracts_new3 <- oahu_tracts |>
+  mutate(
+    dist_new_miles    = apply(dist_new3_adj, 1, min) / 1609.34,
+    improvement_miles = dist_to_nearest_miles - dist_new_miles
+  )
+
+tibble(
+  Metric = c("Mean distance to nearest station (miles)",
+             "Population within 2 miles",
+             "Population beyond 4 miles"),
+  Before = c(
+    round(mean(oahu_tracts$dist_to_nearest_miles), 2),
+    sum(oahu_tracts$estimate[oahu_tracts$dist_to_nearest_miles <= 2]),
+    sum(oahu_tracts$estimate[oahu_tracts$dist_to_nearest_miles > 4])
+  ),
+  After = c(
+    round(mean(oahu_tracts_new3$dist_new_miles), 2),
+    sum(oahu_tracts_new3$estimate[oahu_tracts_new3$dist_new_miles <= 2]),
+    sum(oahu_tracts_new3$estimate[oahu_tracts_new3$dist_new_miles > 4])
+  )
+) |>
+  mutate(Improvement = After - Before,
+         `% Change`  = round((Improvement / Before) * 100, 1)) |>
+  knitr::kable(caption = "Coverage improvement: 3 new stations",
+               format.args = list(big.mark = ","))
+```
+
+```{r}
+mapview(oahu_tracts_new3,
+        zcol = "improvement_miles",
+        layer.name = "Distance Improvement (miles)",
+        col.regions = RColorBrewer::brewer.pal(9, "Blues"),
+        alpha.regions = 0.65) +
+  mapview(fire_stations,
+          col.regions = "red",
+          cex = 7,
+          layer.name = "Existing Stations") +
+  mapview(selected_3stations,
+          col.regions = "darkgreen",
+          cex = 14,
+          layer.name = "3 Recommended New Stations")
+```
+
+### Constrained vs. Unconstrained Comparison
+
+```{r}
+dist_between <- as.numeric(st_distance(selected_unconstrained, selected_constrained)) / 1609.34
+
+mapview(oahu_tracts,
+        zcol = "total_need",
+        layer.name = "Total Need",
+        col.regions = RColorBrewer::brewer.pal(9, "YlOrRd"),
+        alpha.regions = 0.4) +
+  mapview(selected_unconstrained,
+          col.regions = "orange",
+          cex = 14,
+          layer.name = "Unconstrained Optimum") +
+  mapview(selected_constrained,
+          col.regions = "darkgreen",
+          cex = 14,
+          layer.name = "Feasible Optimum (Zoning-Constrained)") +
+  mapview(fire_stations,
+          col.regions = "red",
+          cex = 7,
+          layer.name = "Existing Stations")
+```
+
+The unconstrained and zoning-constrained optima are **`r round(dist_between, 2)` miles apart**.
+
+------------------------------------------------------------------------
+
+## Conclusion
+
+This analysis recommends placing a new fire station on **`r selected_constrained$zone_type`** land in the `r if_else(st_coordinates(selected_constrained)[1] < 607000, "western/central", "eastern")` part of Oahu. This location:
+
+-   Addresses the **largest coverage gap** on the island
+-   Serves the **highest-need communities** based on population and distance
+-   Is situated on land **`r tolower(selected_constrained$conversion_category)`**, making implementation feasible
+
+### Limitations
+
+-   Distances use a terrain-adjusted straight-line approximation rather than true road network routing
+-   OSM land use data may be incomplete; official Honolulu zoning data would improve accuracy
+-   Analysis does not account for land acquisition costs, ownership, or environmental regulations
+-   Future work could incorporate historical call data and traffic patterns
