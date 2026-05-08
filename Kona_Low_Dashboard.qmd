@@ -1,0 +1,315 @@
+---
+title: "Kona Low — March 2026"
+format: 
+  dashboard:
+    theme: darkly
+---
+
+```{css}
+#| echo: false
+.girafe_container_std,
+.girafe_container_std > .girafe,
+.girafe_container_std .girafe_container {
+  width: 100% !important;
+  height: 100% !important;
+}
+.girafe_container_std svg {
+  width: 100% !important;
+  height: 100% !important;
+}
+```
+
+```{r setup}
+#| include: false
+
+library(tidyverse)
+library(plotly)
+library(ggiraph)
+library(maps)
+library(sf)
+library(patchwork)
+library(htmltools)
+
+df <- read.csv("HCDP_data/rainfall/new/day/statewide/partial/station_data/2026/03/rainfall_new_day_statewide_partial_station_data_2026_03.csv")
+
+date_cols <- names(df)[grepl("X2026", names(df))]
+
+df_long <- df %>%
+  pivot_longer(cols = all_of(date_cols),
+               names_to  = "date",
+               values_to = "rainfall") %>%
+  mutate(date = as.Date(gsub("X", "", date), format = "%Y.%m.%d"))
+
+df_stations <- df_long %>%
+  group_by(Station.Name, Island) %>%
+  summarise(total = sum(rainfall, na.rm = TRUE), .groups = "drop") %>%
+  arrange(desc(total)) %>%
+  head(10)
+
+total_rain_in <- round(sum(df_long$rainfall, na.rm = TRUE) * 0.0394 /
+                       length(unique(df_long$Station.Name)), 1)
+
+daily_means <- df_long %>%
+  group_by(date) %>%
+  summarise(mean_in = mean(rainfall, na.rm = TRUE) * 0.0394)
+peak_day  <- daily_means$date[which.max(daily_means$mean_in)]
+
+top_station <- df_stations$Station.Name[1]
+top_island  <- df_stations$Island[1]
+top_total   <- round(df_stations$total[1] * 0.0394, 1)
+```
+
+# Overview
+
+## Row {height="15%"}
+
+```{r}
+#| content: valuebox
+#| title: "Wettest Island"
+list(icon = "geo-alt-fill", color = "success", value = top_island)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Peak Statewide Day"
+list(icon = "droplet-fill", color = "info",
+     value = format(peak_day, "%b %d"))
+```
+
+```{r}
+#| content: valuebox
+#| title: !expr paste0("Wettest Station — ", top_station)
+list(icon = "geo-alt-fill", color = "success", value = top_island)
+```
+
+```{r}
+#| content: valuebox
+#| title: "Top Station Total"
+list(icon = "water", color = "warning",
+     value = paste0(top_total, " in"))
+```
+
+## Row {height="50%"}
+
+### Column {width="60%"}
+
+#### Daily Average Rainfall — Statewide
+
+```{r}
+df_daily <- df_long %>%
+  group_by(date) %>%
+  summarise(mean_rainfall = mean(rainfall, na.rm = TRUE) * 0.0394)
+
+p <- ggplot(df_daily,
+            aes(x = date, y = mean_rainfall,
+                text = paste0("Date: ", format(date, "%b %d"),
+                              "<br>Rainfall: ", round(mean_rainfall, 2), " in"))) +
+  geom_col(fill = "#7c3aed", alpha = 0.85) +
+  geom_line(colour = "#a78bfa", linewidth = 0.8, group = 1) +
+  geom_point(colour = "white", size = 2) +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 days") +
+  labs(x = NULL, y = "Rainfall (in)") +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x      = element_text(angle = 45, hjust = 1),
+        plot.background  = element_rect(fill = "#1a1a2e", colour = NA),
+        panel.background = element_rect(fill = "#1a1a2e", colour = NA),
+        text             = element_text(colour = "white"),
+        axis.text        = element_text(colour = "white"),
+        panel.grid       = element_line(colour = "grey30"))
+
+ggplotly(p, tooltip = "text") %>%
+  layout(paper_bgcolor = "#1a1a2e",
+         plot_bgcolor  = "#1a1a2e",
+         font          = list(color = "white"))
+```
+
+### Column {width="40%"}
+
+#### Big Island — Peak Day (`r format(peak_day, "%B %d")`) {.tabset}
+
+##### 3D View
+
+![](rayshader_output/kona_low_peak_v2.png)
+
+##### Notes
+
+**What this shows.** Daily rainfall draped over Big Island terrain. Bright yellow on the western (Kona / leeward) coast = where the heaviest rain fell.
+
+**Why it matters.** Hawaii's normal rain is trade-wind driven: NE winds hit the eastern slopes and dump rain there, leaving the leeward Kona side dry. **Kona lows reverse this** — a low-pressure system pulls moisture in from the south and the leeward slopes take the brunt.
+
+**Built with.** rayshader for 3D, AWS Terrain Tiles via elevatr for elevation, daily rainfall rasters from HCDP.
+
+## Row {height="35%"}
+
+#### Storm Progression — Big Island in 3D {.flow}
+
+The four panels below show the same Big Island view across the kona low's lifecycle. Watch the rainfall (yellow/green) emerge on the leeward side, peak on March 13, then fade. Compare with the bar chart above — peaks line up.
+
+```{r}
+#| echo: false
+
+panel <- function(label, img, peak = FALSE) {
+  htmltools::div(
+    htmltools::div(
+      label,
+      style = paste0(
+        "color: ", if (peak) "#fbbf24" else "#a78bfa",
+        "; text-align: center; font-weight: ", if (peak) "700" else "600",
+        "; font-size: 0.95rem; margin-bottom: 0.4rem;"
+      )
+    ),
+    htmltools::img(
+      src   = img,
+      style = "width: 100%; border-radius: 4px;"
+    )
+  )
+}
+
+htmltools::div(
+  style = "display: grid; grid-template-columns: repeat(4, 1fr); gap: 1rem; padding: 0.5rem;",
+  panel("March 10 — Calm before",          "rayshader_output/kona_low_day_10.png"),
+  panel("March 13 — Peak (Kona side hit)", "rayshader_output/kona_low_day_13.png", peak = TRUE),
+  panel("March 14 — Still wet",            "rayshader_output/kona_low_day_14.png"),
+  panel("March 17 — Storm fading",         "rayshader_output/kona_low_day_17.png")
+)
+```
+
+# Top Stations
+
+## Row {height="100%"}
+
+### Column {width="72%"}
+
+#### Daily Heatmap + Station Map (Top 10)
+
+```{r}
+hawaii_map <- st_as_sf(map("world", region = "USA:Hawaii",
+                           plot = FALSE, fill = TRUE)) %>%
+  st_set_crs(4326)
+
+df_heat <- df_long %>%
+  filter(Station.Name %in% df_stations$Station.Name) %>%
+  mutate(
+    Station.Name = as.character(Station.Name),
+    rainfall_in  = round(rainfall * 0.0394, 2),
+    tooltip      = paste0("Station: ", Station.Name,
+                          "\nDate: ", format(date, "%b %d"),
+                          "\nRainfall: ", rainfall_in, " in"),
+    data_id      = Station.Name
+  )
+
+df_map_points <- df %>%
+  filter(Station.Name %in% df_stations$Station.Name) %>%
+  mutate(
+    Station.Name = as.character(Station.Name),
+    total_in     = round(rowSums(select(., starts_with("X2026")), na.rm = TRUE) * 0.0394, 2),
+    tooltip      = paste0("Station: ", Station.Name,
+                          "\nIsland: ", Island,
+                          "\nTotal: ", total_in, " in"),
+    data_id      = Station.Name
+  )
+
+p_heat <- ggplot(df_heat,
+                 aes(x = date,
+                     y = reorder(Station.Name, rainfall, sum),
+                     fill = rainfall_in,
+                     tooltip = tooltip,
+                     data_id = data_id)) +
+  geom_tile_interactive(colour = "grey20") +
+  scale_fill_viridis_c(option = "D", na.value = "grey30", name = "in") +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 days") +
+  labs(title = "Daily Rainfall — Top 10 Stations", x = NULL, y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(axis.text.x       = element_text(angle = 45, hjust = 1),
+        plot.background   = element_rect(fill = "#1a1a2e", colour = NA),
+        panel.background  = element_rect(fill = "#1a1a2e", colour = NA),
+        text              = element_text(colour = "white"),
+        axis.text         = element_text(colour = "white"),
+        panel.grid        = element_line(colour = "grey10"),
+        legend.background = element_rect(fill = "#1a1a2e"),
+        plot.title        = element_text(colour = "white", face = "bold"))
+
+p_map <- ggplot() +
+  geom_sf(data = hawaii_map, fill = "#2d4a6e", colour = "white", linewidth = 0.4) +
+  geom_point_interactive(
+    data = df_map_points,
+    aes(x = LON, y = LAT,
+        colour  = total_in,
+        tooltip = tooltip,
+        data_id = data_id),
+    size  = 6,
+    alpha = 0.9
+  ) +
+  scale_colour_viridis_c(option = "D", name = "Total (in)") +
+  labs(title = "Station Locations", x = NULL, y = NULL) +
+  theme_minimal(base_size = 13) +
+  theme(plot.background   = element_rect(fill = "#1a1a2e", colour = NA),
+        panel.background  = element_rect(fill = "#1a1a2e", colour = NA),
+        text              = element_text(colour = "white"),
+        axis.text         = element_text(colour = "white"),
+        panel.grid        = element_line(colour = "grey20"),
+        legend.background = element_rect(fill = "#1a1a2e"),
+        plot.title        = element_text(colour = "white", face = "bold"))
+
+girafe(
+  ggobj      = p_heat + p_map + plot_layout(widths = c(1.6, 1)),
+  width_svg  = 16,
+  height_svg = 9,
+  options = list(
+    opts_sizing(rescale = TRUE, width = 1),
+    opts_hover(css     = "fill:orange; stroke:white; stroke-width:1.5;"),
+    opts_hover_inv(css = "opacity:0.25;"),
+    opts_selection(type = "single",
+                   css  = "fill:orange; stroke:white; stroke-width:2;"),
+    opts_toolbar(saveaspng = TRUE)
+  )
+)
+```
+
+### Column {width="28%"}
+
+#### About this view
+
+**Linked highlighting.** Hover over a row in the heatmap and the matching station glows on the map. Click a dot on the map and the corresponding heatmap row pulses.
+
+**What you're seeing.** The heatmap (left) shows daily rainfall in inches for the 10 stations that received the most total rain in March 2026. Stations are ordered top-to-bottom by total monthly rainfall — the wettest is at the top.
+
+**Reading the kona low.** The bright vertical band running down most stations around **March 12–14** is the kona low's fingerprint. Most Hawaii rainstorms are localized — they hit only certain windward stations. A statewide event where almost every top station lights up at once is unusual.
+
+**Geography.** Most top-10 stations sit on the windward (NE) side of their island where rain normally falls. But for this event, leeward stations also took heavy hits — another kona low signature, since these systems pull moisture in from the south and dump it on slopes that are usually shielded.
+
+# Heatmap
+
+## Row
+
+#### All Top 10 Stations — Daily Rainfall
+
+```{r}
+df_heat_all <- df_long %>%
+  filter(Station.Name %in% df_stations$Station.Name) %>%
+  mutate(rainfall_in = round(rainfall * 0.0394, 2))
+
+p <- ggplot(df_heat_all,
+            aes(x = date,
+                y = reorder(Station.Name, rainfall, sum),
+                fill = rainfall_in,
+                text = paste0("Station: ", Station.Name,
+                              "<br>Date: ", format(date, "%b %d"),
+                              "<br>Rainfall: ", rainfall_in, " in"))) +
+  geom_tile(colour = "grey20") +
+  scale_fill_viridis_c(option = "D", na.value = "grey30", name = "in") +
+  scale_x_date(date_labels = "%b %d", date_breaks = "2 days") +
+  labs(x = NULL, y = NULL) +
+  theme_minimal(base_size = 12) +
+  theme(axis.text.x      = element_text(angle = 45, hjust = 1),
+        plot.background  = element_rect(fill = "#1a1a2e", colour = NA),
+        panel.background = element_rect(fill = "#1a1a2e", colour = NA),
+        text             = element_text(colour = "white"),
+        axis.text        = element_text(colour = "white"),
+        panel.grid       = element_line(colour = "grey10"))
+
+ggplotly(p, tooltip = "text") %>%
+  layout(paper_bgcolor = "#1a1a2e",
+         plot_bgcolor  = "#1a1a2e",
+         font          = list(color = "white"))
+```
